@@ -11,6 +11,7 @@ This repository contains the ML methodology code behind [EPForecast](https://epf
 - **Live dashboard:** [epf.productjorge.com](https://epf.productjorge.com)
 - **Full documentation:** [epforecast.vercel.app](https://epforecast.vercel.app)
 - **Methodology changelog:** [epforecast.vercel.app/changelog/overview](https://epforecast.vercel.app/changelog/overview)
+- **Case study — Iran crisis (March 2026):** [epforecast.vercel.app/blog/iran-crisis-analysis](https://epforecast.vercel.app/blog/iran-crisis-analysis)
 
 ## Methodology Overview
 
@@ -36,19 +37,25 @@ See [`src/data/feature_engineering.py`](src/data/feature_engineering.py) for all
 
 ### Model Architecture (v10.1)
 
-The production ensemble combines three gradient boosting models with a pre-trained LSTM encoder:
+The production model is an **LSTM-XGBoost hybrid**: a pre-trained LSTM encoder processes the last 7 days of prices into 64-dimensional temporal embeddings, which are appended to XGBoost's 90 tabular features (154 features total).
 
-#### Gradient Boosting Ensemble
+```
+Price sequence (last 168 hours)
+         ↓
+   LSTM encoder (2 layers × 64 hidden)
+         ↓
+  64-dim temporal embeddings
+         ↓
+XGBoost (90 tabular + 64 LSTM = 154 features)
+         ↓
+  Day-ahead price forecast
+```
 
-Three implementations trained independently and combined via equal-weight averaging:
-
-| Model | Library | Loss | Key Config |
-|-------|---------|------|------------|
-| HistGradientBoosting | scikit-learn | `quantile` (q=0.55) | depth-wise, native NaN support |
-| LightGBM | Microsoft | `quantile` (alpha=0.55) | leaf-wise, GPU support |
-| XGBoost | Distributed ML | `reg:quantileerror` (alpha=0.55) | histogram binning, CUDA support |
+XGBoost is trained with quantile loss (q=0.55) on a **residual-from-baseline target** — it predicts the deviation from the weekly median price, not raw EUR/MWh. This isolates the regime-change signal and avoids the range-compression problem tree models have on raw prices.
 
 **Why quantile loss (q=0.55)?** Electricity prices are right-skewed (bounded near zero, occasional spikes >200 EUR/MWh). Quantile loss at 0.55 shifts predictions slightly above the median, directly correcting the systematic underprediction bias inherent in skewed distributions.
+
+> **Legacy (v4.3):** Prior to v10.0, the ensemble combined HistGradientBoosting, LightGBM, and XGBoost with equal-weight averaging. That architecture is still in the codebase (`trainer.py`) for reference.
 
 #### LSTM Price Encoder (v10.0+)
 
@@ -94,6 +101,19 @@ Split conformal prediction with asymmetric bands — 50% and 90% intervals calib
 | v4.3 (baseline) | D+2–D+7 Strategic | 19.79 EUR/MWh | Gradient boosting only |
 
 The LSTM encoder (v10.0) broke a structural plateau held since v4.3 — tree-based models were compressing the prediction range to ~73% of actual variance due to leaf averaging. LSTM embeddings provide temporal context that gradient boosting cannot learn from flattened features alone.
+
+## What Didn't Work
+
+121 experiments were run across 10 major versions. These are the approaches that failed or were rejected, documented here because the failures are as informative as the wins:
+
+| Approach | Outcome | Why rejected |
+|----------|---------|-------------|
+| Pure LSTM (no gradient boosting) | MAE ~15.2 EUR/MWh | Worse than GB-only baseline; sequence model alone underfits tabular features |
+| LSTM + price weighting | Degraded on every trial (tested ×3) | Upweighting recent/high-price samples destabilises the embedding gradient |
+| 4-week residual baseline | Regime memory bias | When prices shift level, the 4-week baseline lags for weeks, creating persistent residual error |
+| Generic LSTM encoder (next-1h target) | +8.5% vs v4.3 | Task-aligned encoder (next-24h joint prediction) consistently outperformed generic one |
+| Recursive forecasting (roll-forward single model) | Error compounding on D+3+ | Direct per-horizon models eliminate this; each horizon group trains its own model |
+| Naive residual target (predict price − lag-24h) | Marginal improvement | Weekly median baseline captures more of the mean-reverting component than a single lag |
 
 ## Repository Structure
 
