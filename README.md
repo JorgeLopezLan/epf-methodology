@@ -1,6 +1,6 @@
 # EPForecast Methodology
 
-**Spanish Electricity Price Forecasting with Gradient Boosting Ensembles**
+**Spanish Electricity Price Forecasting with Gradient Boosting + LSTM Ensembles**
 
 This repository contains the ML methodology code behind [EPForecast](https://epf.productjorge.com), a system that predicts Spanish day-ahead electricity prices (OMIE market) at hourly and 15-minute resolution, 7 days ahead.
 
@@ -34,9 +34,13 @@ Features are organized into 5 categories:
 
 See [`src/data/feature_engineering.py`](src/data/feature_engineering.py) for all feature definitions.
 
-### Model Architecture
+### Model Architecture (v10.1)
 
-Three gradient boosting implementations trained independently and combined via equal-weight averaging:
+The production ensemble combines three gradient boosting models with a pre-trained LSTM encoder:
+
+#### Gradient Boosting Ensemble
+
+Three implementations trained independently and combined via equal-weight averaging:
 
 | Model | Library | Loss | Key Config |
 |-------|---------|------|------------|
@@ -44,7 +48,15 @@ Three gradient boosting implementations trained independently and combined via e
 | LightGBM | Microsoft | `quantile` (alpha=0.55) | leaf-wise, GPU support |
 | XGBoost | Distributed ML | `reg:quantileerror` (alpha=0.55) | histogram binning, CUDA support |
 
-**Why quantile loss (q=0.55)?** Electricity prices are right-skewed (bounded near zero, occasional spikes >200 EUR/MWh). Standard MAE targets the median; quantile loss at 0.55 shifts predictions slightly above the median, directly correcting the systematic underprediction bias inherent in skewed distributions.
+**Why quantile loss (q=0.55)?** Electricity prices are right-skewed (bounded near zero, occasional spikes >200 EUR/MWh). Quantile loss at 0.55 shifts predictions slightly above the median, directly correcting the systematic underprediction bias inherent in skewed distributions.
+
+#### LSTM Price Encoder (v10.0+)
+
+A pre-trained LSTM converts the last 168 hours of prices into a 64-dimensional embedding, added as extra features to the gradient boosting models. This captures temporal patterns that flattened lag columns cannot represent — in particular, multi-day trend and volatility regime signals.
+
+Key finding: LSTM embeddings combined with **residual-from-baseline targeting** (predict deviation from weekly median rather than raw price) yielded the largest single improvement in the project, breaking the structural ceiling that tree-based models hit at v4.3.
+
+See [`src/models/lstm_embedder.py`](src/models/lstm_embedder.py) for the implementation.
 
 ### Direct Multi-Horizon Prediction
 
@@ -55,7 +67,7 @@ Instead of recursive forecasting (which accumulates errors), each forecast horiz
 
 This avoids error propagation across horizons and allows different feature sets per horizon group.
 
-### Feature Selection (v4.3)
+### Feature Selection
 
 A two-stage per-horizon pipeline prunes noise features:
 
@@ -70,17 +82,18 @@ See [`src/models/feature_selection.py`](src/models/feature_selection.py) for the
 
 Split conformal prediction with asymmetric bands — 50% and 90% intervals calibrated from out-of-fold residuals, bucketed by horizon group.
 
-## Results (v4.3 Backtest)
+## Results
 
-149-day walk-forward backtest (October 2025 – February 2026):
+150-day walk-forward backtest (October 2025 – March 2026):
 
-| Product | Ensemble MAE | Best Single Model |
-|---------|:-----------:|:-----------------:|
-| D+1 Day-Ahead | **14.47 EUR/MWh** | XGBoost (13.95) |
-| D+2–D+7 Strategic | **19.79 EUR/MWh** | HistGBT (21.42) |
+| Version | Product | Ensemble MAE | Notes |
+|---------|---------|:------------:|-------|
+| **v10.1** (current) | D+1 Day-Ahead | **12.69 EUR/MWh** | LSTM + residual target |
+| **v10.1** (current) | D+2–D+7 Strategic | **17.84 EUR/MWh** | LSTM + residual target |
+| v4.3 (baseline) | D+1 Day-Ahead | 14.47 EUR/MWh | Gradient boosting only |
+| v4.3 (baseline) | D+2–D+7 Strategic | 19.79 EUR/MWh | Gradient boosting only |
 
-February 2026 (high-volatility period driven by gas price spikes):
-- D+1 MAE: **7.97 EUR/MWh** — best single-month result
+The LSTM encoder (v10.0) broke a structural plateau held since v4.3 — tree-based models were compressing the prediction range to ~73% of actual variance due to leaf averaging. LSTM embeddings provide temporal context that gradient boosting cannot learn from flattened features alone.
 
 ## Repository Structure
 
@@ -93,20 +106,75 @@ src/
     ├── trainer.py               # Model factory: HistGBT, LightGBM, XGBoost
     ├── direct_trainer.py        # Multi-horizon training + feature building
     ├── direct_predictor.py      # Inference: 7-day forecast generation
+    ├── lstm_embedder.py         # LSTM price encoder (v10.0+)
     ├── evaluation.py            # MAE, RMSE, MAPE, per-hour/per-day evaluation
     └── feature_selection.py     # Two-stage selection (correlation + permutation)
 ```
 
+## Setup & Running
+
+### Requirements
+
+Python 3.12 recommended. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+For LSTM embeddings (v10.0+), PyTorch is required (included in `requirements.txt`). If you only want to run the gradient boosting baseline, torch is optional.
+
+### Configuration
+
+Set the model artifact directory before training:
+
+```python
+# src/config.py
+MODELS_DIR = "path/to/your/models/directory"  # where .joblib files are saved
+```
+
+### Training a Model
+
+```python
+from src.models.direct_trainer import DirectTrainer
+
+trainer = DirectTrainer(
+    horizon_group="DA1",   # DA1, DA2, S1, S2, S3, S4, S5
+    approach="hybrid15",   # hybrid15 (default), hourly, pure15
+)
+trainer.fit(df_features)   # df_features: DataFrame with all feature columns + target
+trainer.save()             # saves .joblib to MODELS_DIR
+```
+
+### Generating Forecasts
+
+```python
+from src.models.direct_predictor import DirectPredictor
+
+predictor = DirectPredictor(run_mode="dayahead")  # or "strategic"
+forecasts = predictor.predict(origin_dt, ree_df, weather_df, commodity_df)
+```
+
+### Input Data Format
+
+The training DataFrame requires:
+- **Index:** `pd.DatetimeIndex` at hourly or 15-minute frequency (UTC)
+- **Target column:** `day_ahead_price` (EUR/MWh)
+- **Feature columns:** as generated by `feature_engineering.py`
+
+See the [full documentation](https://epforecast.vercel.app) for data source details and column specifications.
+
 ## Version History
 
-| Version | Date | Key Changes | Impact |
-|---------|------|-------------|--------|
-| v4.3 | 2026-03-05 | Feature selection pipeline | Strategic MAE 19.79 (-2.8%) |
-| v4.2 | 2026-03-04 | 24 crisis-responsive features | Strategic MAE 20.36 (-2.0%) |
-| v4.1 | 2026-03-02 | Quantile loss + 15 weather interactions | DA MAE 13.42 (-18.2%) |
-| v3.1 | 2026-02-26 | MAE loss + bias correction | Bias: -6.94 to -0.30 |
-| v2.0 | 2026-02-17 | Multi-model ensemble + conformal | Reduced variance |
-| v1.0 | 2026-02-12 | Initial single-model release | First deployment |
+| Version | Key Changes | DA MAE Impact |
+|---------|-------------|:-------------:|
+| v10.1 | Task-aligned LSTM (24h output), exogenous inputs | 12.69 EUR/MWh |
+| v10.0 | LSTM price encoder + residual-from-baseline target | -12.3% vs v4.3 |
+| v4.3 | Feature selection pipeline (two-stage, per-horizon) | 14.47 EUR/MWh |
+| v4.2 | 24 crisis-responsive features (gas/oil stress signals) | -2.0% |
+| v4.1 | Quantile loss (q=0.55) + 15 weather interactions | -18.2% |
+| v3.1 | MAE loss + bias correction | Bias: -6.94 → -0.30 |
+| v2.0 | Multi-model ensemble + conformal prediction intervals | Reduced variance |
+| v1.0 | Initial single-model release | First deployment |
 
 ## Citation
 
@@ -115,7 +183,7 @@ If you use this methodology in your research, please cite:
 ```
 @software{epforecast2026,
   author = {Lopez Lan, Jorge},
-  title = {EPForecast: Spanish Electricity Price Forecasting with Gradient Boosting Ensembles},
+  title = {EPForecast: Spanish Electricity Price Forecasting with Gradient Boosting and LSTM Ensembles},
   year = {2026},
   url = {https://github.com/JorgeLopezLan/epf-methodology}
 }

@@ -236,9 +236,25 @@ def build_features(ree_df: pd.DataFrame,
             # GHI interaction with solar generation share
             df["ghi_x_solar_share"] = df["ghi_wm2"] * df["solar_share"]
 
-            # Solar angle (sun elevation)
-            from src.data.openmeteo_historical_collector import compute_solar_angle
-            df["solar_elevation_deg"] = compute_solar_angle(df.index)
+            # Solar angle (sun elevation) — inlined, no external dependency
+            def _compute_solar_angle(dt_index, latitude=40.53):
+                """Approximate solar elevation angle (degrees) for Spain."""
+                day_of_year = dt_index.dayofyear
+                hour_utc = dt_index.hour + dt_index.minute / 60.0
+                B = 2 * np.pi * (day_of_year - 1) / 365.0
+                declination = np.degrees(
+                    0.006918 - 0.399912 * np.cos(B) + 0.070257 * np.sin(B)
+                    - 0.006758 * np.cos(2 * B) + 0.000907 * np.sin(2 * B)
+                )
+                solar_time = hour_utc + 0.23  # longitude correction ~3.5°W
+                hour_angle = 15.0 * (solar_time - 12.0)
+                lat_rad = np.radians(latitude)
+                dec_rad = np.radians(declination)
+                ha_rad = np.radians(hour_angle)
+                sin_elev = (np.sin(lat_rad) * np.sin(dec_rad)
+                            + np.cos(lat_rad) * np.cos(dec_rad) * np.cos(ha_rad))
+                return np.degrees(np.arcsin(np.clip(sin_elev, -1, 1)))
+            df["solar_elevation_deg"] = _compute_solar_angle(df.index)
             df["is_daylight"] = (df["solar_elevation_deg"] > 0).astype(float)
 
             # Clear-sky index: ratio of actual GHI to theoretical max
