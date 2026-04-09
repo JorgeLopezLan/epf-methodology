@@ -1,3 +1,7 @@
+# EPForecast Methodology — Evaluation Metrics
+# Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
+# Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+
 import logging
 import numpy as np
 import pandas as pd

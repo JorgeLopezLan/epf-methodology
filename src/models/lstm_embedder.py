@@ -1,3 +1,17 @@
+# EPForecast Methodology — LSTM Price Encoder (RETRACTED v10.x)
+# Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
+# Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+#
+# RETRACTION NOTICE (2026-04-09): The v10.x line of LSTM-XGBoost hybrid
+# experiments was retracted after two layered code-level bugs were found
+# that meant the LSTM block contributed zero useful signal at both training
+# and inference time. v11.0 production drops LSTM entirely. This file is
+# kept as historical reference and as scaffolding for any future research
+# that wants to retry LSTM after the bugs are properly fixed. The drift
+# guard at the 15-min inference call sites in direct_predictor.py raises
+# loudly if anyone re-enables LSTM. See SANITIZATION_RULES.md and the v11.0
+# changelog for the full story.
+
 """
 LSTM Price Encoder for EPF v10.0
 =================================

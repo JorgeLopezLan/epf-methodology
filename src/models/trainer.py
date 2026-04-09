@@ -1,6 +1,13 @@
 # EPForecast Methodology — Model Training
 # Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
 # Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+#
+# Updated 2026-04-09 to v11.0 (M0.6 Phase F cutover). v11.0 production is
+# single-XGBoost (model_type="xgboost") + residual_1w + pw3x + d365. The
+# HistGB and LightGBM branches are kept for historical reference and for
+# users who want to reproduce the v4.3-era 3-base ensemble experiments. The
+# v10.x LSTM line of experiments was retracted on 2026-04-09 — see
+# direct_predictor.py header and SANITIZATION_RULES.md.
 
 import logging
 import datetime
@@ -12,8 +19,6 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 MODELS_DIR = None  # Set to your model artifacts directory (pathlib.Path)
-
-# Conformal prediction calibration (not included in this extract)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +43,28 @@ def _create_model(model_type: str = "histgb", params: dict | None = None,
                   gpu: bool = False, quantile: float | None = None):
     """Factory: create a regression model by type, optionally on GPU.
 
+    Tree hyperparameters are overridable via env vars (no code patches needed):
+      EPF_MAX_DEPTH       — tree depth (default 8)
+      EPF_LEARNING_RATE   — shrinkage (default 0.05)
+      EPF_MIN_CHILD       — min samples per leaf (default 20)
+      EPF_REG_LAMBDA      — L2 regularization (default 0.1)
+      EPF_N_ESTIMATORS    — number of trees (default 500)
+
     Args:
         quantile: If set (e.g. 0.55), use quantile loss instead of MAE.
                   Targets the given percentile of the conditional distribution.
     """
+    import os
+    _depth = int(os.environ.get("EPF_MAX_DEPTH", "12"))
+    _lr = float(os.environ.get("EPF_LEARNING_RATE", "0.03"))
+    _min_child = int(os.environ.get("EPF_MIN_CHILD", "5"))
+    _reg_lambda = float(os.environ.get("EPF_REG_LAMBDA", "0.3"))
+    _n_est = int(os.environ.get("EPF_N_ESTIMATORS", "500"))
+
+    if _depth != 12 or _lr != 0.03 or _min_child != 5 or _reg_lambda != 0.3:
+        logger.info("Tree overrides: depth=%d lr=%.3f min_child=%d lambda=%.2f n_est=%d",
+                     _depth, _lr, _min_child, _reg_lambda, _n_est)
+
     if model_type == "histgb":
         if gpu:
             logger.warning("HistGradientBoosting has no GPU support. "
@@ -49,8 +72,8 @@ def _create_model(model_type: str = "histgb", params: dict | None = None,
                            "Falling back to CPU.")
         defaults = {
             "loss": "absolute_error",
-            "max_iter": 500, "max_depth": 8, "learning_rate": 0.05,
-            "min_samples_leaf": 20, "l2_regularization": 0.1,
+            "max_iter": _n_est, "max_depth": _depth, "learning_rate": _lr,
+            "min_samples_leaf": _min_child, "l2_regularization": _reg_lambda,
             "early_stopping": True, "validation_fraction": 0.1,
             "n_iter_no_change": 20, "random_state": 42,
         }
@@ -64,11 +87,12 @@ def _create_model(model_type: str = "histgb", params: dict | None = None,
             import lightgbm as lgb
         except ImportError:
             raise ImportError("lightgbm required: pip install lightgbm>=4.3.0")
+        _num_leaves = min(2 ** _depth - 1, 255) if _depth > 6 else 63
         defaults = {
             "objective": "mae",
-            "n_estimators": 500, "max_depth": 8, "learning_rate": 0.05,
-            "min_child_samples": 20, "reg_lambda": 0.1,
-            "num_leaves": 63, "random_state": 42, "verbose": -1,
+            "n_estimators": _n_est, "max_depth": _depth, "learning_rate": _lr,
+            "min_child_samples": _min_child, "reg_lambda": _reg_lambda,
+            "num_leaves": _num_leaves, "random_state": 42, "verbose": -1,
         }
         if quantile is not None:
             defaults["objective"] = "quantile"
@@ -85,11 +109,45 @@ def _create_model(model_type: str = "histgb", params: dict | None = None,
             raise ImportError("xgboost required: pip install xgboost")
         defaults = {
             "objective": "reg:absoluteerror",
-            "n_estimators": 500, "max_depth": 8, "learning_rate": 0.05,
-            "reg_lambda": 0.1, "random_state": 42, "verbosity": 0,
+            "n_estimators": _n_est, "max_depth": _depth, "learning_rate": _lr,
+            "reg_lambda": _reg_lambda, "random_state": 42, "verbosity": 0,
             "tree_method": "hist",
         }
-        if quantile is not None:
+        # GPU acceleration: use CUDA if available
+        _use_gpu = os.environ.get("EPF_USE_GPU", "auto")
+        if _use_gpu == "auto":
+            try:
+                import xgboost as _xgb_test
+                _d = _xgb_test.DMatrix([[0]], label=[0])
+                _xgb_test.train({"tree_method": "hist", "device": "cuda", "max_depth": 2}, _d, num_boost_round=1)
+                defaults["device"] = "cuda"
+                logger.info("XGBoost using GPU (CUDA)")
+            except Exception:
+                logger.info("XGBoost using CPU (no GPU available)")
+        elif _use_gpu == "true":
+            defaults["device"] = "cuda"
+            logger.info("XGBoost using GPU (forced)")
+        if _min_child != 20:
+            defaults["min_child_weight"] = _min_child
+        # V7: Custom asymmetric loss — penalize underprediction of high prices
+        _asym_factor = os.environ.get("EPF_ASYM_LOSS_FACTOR", "")
+        _asym_thresh = float(os.environ.get("EPF_ASYM_LOSS_THRESHOLD", "80"))
+        if _asym_factor:
+            _af = float(_asym_factor)
+            _at = _asym_thresh
+            def _asym_obj(y_true, y_pred):
+                import numpy as _np
+                residual = y_pred - y_true
+                grad = _np.where(residual < 0, -1.0, 1.0)  # MAE gradient
+                hess = _np.ones_like(grad)
+                # Boost gradient for underprediction of high prices
+                high_under = (y_true > _at) & (residual < 0)
+                grad[high_under] *= _af
+                hess[high_under] *= _af
+                return grad, hess
+            defaults["objective"] = _asym_obj
+            logger.info("XGBoost: asymmetric loss (factor=%.1f, threshold=%.0f)", _af, _at)
+        elif quantile is not None:
             defaults["objective"] = "reg:quantileerror"
             defaults["quantile_alpha"] = quantile
         if gpu:
@@ -97,6 +155,78 @@ def _create_model(model_type: str = "histgb", params: dict | None = None,
             logger.info("XGBoost: CUDA GPU training enabled")
         defaults.update(params or {})
         return xgb.XGBRegressor(**defaults)
+    elif model_type == "catboost":
+        try:
+            from catboost import CatBoostRegressor
+        except ImportError:
+            raise ImportError("catboost required: pip install catboost")
+        defaults = {
+            "iterations": _n_est, "depth": _depth, "learning_rate": _lr,
+            "l2_leaf_reg": _reg_lambda * 30, "random_seed": 42, "verbose": 0,
+            "loss_function": "MAE",
+        }
+        if quantile is not None:
+            defaults["loss_function"] = f"Quantile:alpha={quantile}"
+        if gpu:
+            defaults["task_type"] = "GPU"
+            logger.info("CatBoost: GPU training enabled")
+        defaults.update(params or {})
+        return CatBoostRegressor(**defaults)
+    elif model_type == "mlp":
+        from sklearn.neural_network import MLPRegressor
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.impute import SimpleImputer
+        # Env var overrides for MLP architecture
+        _hidden = os.environ.get("EPF_MLP_HIDDEN", "")
+        _lr = float(os.environ.get("EPF_MLP_LR", "0.001"))
+        _max_iter = int(os.environ.get("EPF_MLP_MAX_ITER", "200"))
+        defaults = {
+            "hidden_layer_sizes": tuple(int(x) for x in _hidden.split(",")) if _hidden else (256, 128, 64),
+            "learning_rate_init": _lr,
+            "max_iter": _max_iter,
+            "early_stopping": True,
+            "validation_fraction": 0.1,
+            "n_iter_no_change": 20,
+            "random_state": 42,
+            "verbose": False,
+        }
+        defaults.update(params or {})
+        logger.info("MLP: %s, lr=%.4f, max_iter=%d", defaults["hidden_layer_sizes"], defaults["learning_rate_init"], defaults["max_iter"])
+        # Wrap in pipeline: impute NaN → scale → (optional feature select) → MLP
+        mlp = MLPRegressor(**defaults)
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+        _top_n = os.environ.get("EPF_MLP_TOP_FEATURES", "")
+        if _top_n:
+            from sklearn.feature_selection import SelectKBest, mutual_info_regression
+            steps.append(("select", SelectKBest(mutual_info_regression, k=int(_top_n))))
+            logger.info("MLP: selecting top %s features by mutual information", _top_n)
+        steps.append(("mlp", mlp))
+        return Pipeline(steps)
+    elif model_type == "tft":
+        from src.models.tft_model import TFTRegressor
+        _hidden = int(os.environ.get("EPF_TFT_HIDDEN", "128"))
+        _layers = int(os.environ.get("EPF_TFT_LAYERS", "3"))
+        _dropout = float(os.environ.get("EPF_TFT_DROPOUT", "0.2"))
+        _tft_lr = float(os.environ.get("EPF_TFT_LR", "0.001"))
+        _batch = int(os.environ.get("EPF_TFT_BATCH_SIZE", "512"))
+        _epochs = int(os.environ.get("EPF_TFT_MAX_EPOCHS", "200"))
+        _patience = int(os.environ.get("EPF_TFT_PATIENCE", "20"))
+        _loss = os.environ.get("EPF_TFT_LOSS", "huber")
+        _wd = float(os.environ.get("EPF_TFT_WEIGHT_DECAY", "0.0001"))
+        defaults = {
+            "hidden_dim": _hidden, "n_layers": _layers, "dropout": _dropout,
+            "lr": _tft_lr, "batch_size": _batch, "max_epochs": _epochs,
+            "patience": _patience, "loss_fn": _loss, "weight_decay": _wd,
+            "device": "cuda" if gpu else "auto",
+        }
+        defaults.update(params or {})
+        logger.info("TFT: hidden=%d, layers=%d, dropout=%.2f, lr=%.4f, batch=%d, epochs=%d, loss=%s",
+                     _hidden, _layers, _dropout, _tft_lr, _batch, _epochs, _loss)
+        return TFTRegressor(**defaults)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -169,10 +299,7 @@ class ModelTrainer:
         return fold_metrics
 
     def save_model(self, version: str | None = None) -> str:
-        """Save model to disk with metadata. Returns the file path.
-
-        Note: Conformal calibrator serialization is not included in this extract.
-        """
+        """Save model to disk with metadata. Returns the file path."""
         if self.model is None:
             raise ValueError("No trained model to save")
 
@@ -186,18 +313,17 @@ class ModelTrainer:
             "trained_at": datetime.datetime.utcnow().isoformat(),
             "feature_names": self.feature_names,
             "cv_metrics": self.metrics,
-            # Conformal calibrator serialization not included in this extract
-            "conformal_calibrator": None,
+            "conformal_calibrator": (
+                self.conformal_calibrator.to_dict()
+                if self.conformal_calibrator else None
+            ),
         }
         joblib.dump(artifact, path)
         logger.info("Model saved to %s", path)
         return str(path)
 
     def load_model(self, version: str = "latest") -> dict:
-        """Load a model from disk. Returns the full artifact dict.
-
-        Note: Conformal calibrator deserialization is not included in this extract.
-        """
+        """Load a model from disk. Returns the full artifact dict."""
         if version == "latest":
             model_files = sorted(MODELS_DIR.glob("model_*.joblib"))
             if not model_files:
@@ -211,8 +337,14 @@ class ModelTrainer:
         self.feature_names = artifact["feature_names"]
         self.metrics = artifact.get("cv_metrics", [])
 
-        # Conformal calibrator deserialization not included in this extract
-        self.conformal_calibrator = None
+        cal_data = artifact.get("conformal_calibrator")
+        if cal_data:
+            from src.models.conformal import ConformalCalibrator
+            self.conformal_calibrator = ConformalCalibrator.from_dict(cal_data)
+            logger.info("Conformal calibrator loaded (%d buckets)",
+                        len(self.conformal_calibrator.residuals_by_bucket))
+        else:
+            self.conformal_calibrator = None
 
         logger.info("Loaded model %s (trained %s)", artifact["version"], artifact["trained_at"])
         return artifact
@@ -223,13 +355,13 @@ class ModelTrainer:
 
         Used by the recursive predictor, whose CV residuals don't reflect
         recursive error compounding. This uses real deployed performance.
-
-        Note: Conformal calibration is not included in this extract.
         """
-        # Conformal calibration (build_calibrator_from_predictions) is not included
-        # in this extract. See the full EPForecast project for the implementation.
-        logger.warning("Conformal calibration is not available in this extract.")
-        return None
+        from src.models.conformal import build_calibrator_from_predictions
+        predictions_df = pipeline.get_predictions(days_back=90)
+        calibrator = build_calibrator_from_predictions(predictions_df)
+        if calibrator:
+            self.conformal_calibrator = calibrator
+        return calibrator
 
     def get_feature_importances(self) -> pd.Series:
         """Return feature importances sorted by magnitude."""

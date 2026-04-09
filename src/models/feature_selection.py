@@ -1,3 +1,7 @@
+# EPForecast Methodology — Feature Selection
+# Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
+# Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+
 """
 Feature selection pipeline for EPF direct multi-horizon models.
 
