@@ -1,6 +1,16 @@
 # EPForecast Methodology — Direct Multi-Horizon Predictor
 # Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
 # Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+#
+# Updated 2026-04-09 to v11.0 (M0.6 Phase C). v11.0 = single XGBoost +
+# residual_1w + pw3x + d365 (no LSTM, no ensemble). The v10.x LSTM-XGBoost
+# hybrid line of experiments was retracted on 2026-04-09 after two layered
+# code-level bugs were found that meant the LSTM block contributed zero
+# useful signal at both training and inference time. The drift guard at the
+# 15-min inference call sites raises loudly if anyone re-enables LSTM
+# without first fixing the underlying bugs. See SANITIZATION_RULES.md and
+# the v11.0 changelog page on the project website for the full retraction
+# story.
 
 """
 Direct multi-horizon predictor for EPF.
@@ -167,6 +177,16 @@ class DirectPredictor:
                     except Exception as e:
                         logger.warning("Prediction error for %s h=%d: %s", group_name, h, e)
                         pred_price = float(price.tail(24).mean())
+
+                    # S1: Inverse target transform — add baseline back
+                    _tt = getattr(self.trainer, 'target_transform', 'none')
+                    if _tt in ("residual_1w", "residual_4w", "residual_4w_ewm"):
+                        _bl_key = ("target_baseline_1w" if _tt == "residual_1w"
+                                   else "target_baseline_4w_ewm" if _tt == "residual_4w_ewm"
+                                   else "target_baseline_4w")
+                        _bl_val = feat.get(_bl_key)
+                        if _bl_val is not None and not np.isnan(_bl_val):
+                            pred_price = pred_price + _bl_val
                 else:
                     pred_price = float(price.tail(24).mean())
 
@@ -183,6 +203,23 @@ class DirectPredictor:
         result = pd.DataFrame(predictions)
         # Sort by target datetime
         result = result.sort_values(["target_date", "target_hour"]).reset_index(drop=True)
+
+        # Apply post-processing: isotonic calibration → residual correction
+        if len(result) > 0 and (self.trainer.isotonic_calibrator or self.trainer.residual_corrector):
+            hours_ahead = result["_hours_ahead"].values
+            target_hours = result["target_hour"].values.astype(float)
+            # Derive day-of-week from target_date
+            target_dows = pd.to_datetime(result["target_date"]).dt.dayofweek.values.astype(float)
+
+            if self.trainer.isotonic_calibrator:
+                result["predicted_price"] = self.trainer.isotonic_calibrator.transform(
+                    result["predicted_price"].values, hours_ahead)
+                logger.info("Applied isotonic calibration")
+
+            if self.trainer.residual_corrector:
+                result["predicted_price"] = self.trainer.residual_corrector.apply(
+                    result["predicted_price"].values, target_hours, target_dows, hours_ahead)
+                logger.info("Applied residual correction")
 
         # Add confidence intervals if conformal calibrator is available
         if self.trainer.conformal_calibrator is not None and len(result) > 0:
@@ -272,6 +309,16 @@ class DirectPredictor:
                         pred_price = float(model.predict(row[feature_cols].values)[0])
                     except Exception:
                         pred_price = float(price.tail(24).mean())
+
+                    # S1: Inverse target transform — add baseline back
+                    _tt = getattr(self.trainer, 'target_transform', 'none')
+                    if _tt in ("residual_1w", "residual_4w", "residual_4w_ewm"):
+                        _bl_key = ("target_baseline_1w" if _tt == "residual_1w"
+                                   else "target_baseline_4w_ewm" if _tt == "residual_4w_ewm"
+                                   else "target_baseline_4w")
+                        _bl_val = feat.get(_bl_key)
+                        if _bl_val is not None and not np.isnan(_bl_val):
+                            pred_price = pred_price + _bl_val
                 else:
                     pred_price = float(price.tail(24).mean())
 
@@ -287,6 +334,20 @@ class DirectPredictor:
 
         result = pd.DataFrame(predictions)
         result = result.sort_values(["target_date", "target_hour"]).reset_index(drop=True)
+
+        # Apply post-processing: isotonic calibration → residual correction
+        if len(result) > 0 and (self.trainer.isotonic_calibrator or self.trainer.residual_corrector):
+            hours_ahead = result["_hours_ahead"].values
+            target_hours = result["target_hour"].values.astype(float)
+            target_dows = pd.to_datetime(result["target_date"]).dt.dayofweek.values.astype(float)
+
+            if self.trainer.isotonic_calibrator:
+                result["predicted_price"] = self.trainer.isotonic_calibrator.transform(
+                    result["predicted_price"].values, hours_ahead)
+
+            if self.trainer.residual_corrector:
+                result["predicted_price"] = self.trainer.residual_corrector.apply(
+                    result["predicted_price"].values, target_hours, target_dows, hours_ahead)
 
         if self.trainer.conformal_calibrator is not None and len(result) > 0:
             intervals = self.trainer.conformal_calibrator.predict_intervals(
@@ -372,6 +433,31 @@ class DirectPredictor:
 
                 if feat is not None:
                     row = pd.DataFrame([feat])
+                    # Drift guard (added 2026-04-08): refuse to silently
+                    # zero-fill missing lstm_emb_* features when LSTM is enabled.
+                    # Historical bug: _build_origin_features_15min never calls
+                    # LSTMEmbedder.compute_embedding(), so any lstm_emb_* feature
+                    # in the trained model's feature_cols was being filled with
+                    # 0.0 below, producing degraded predictions with no surfaced
+                    # error. The guard is opt-in via the same env var that
+                    # enables LSTM, so toggling it off is bit-identical to the
+                    # pre-guard behaviour and never raises in current production.
+                    import os as _os_drift_guard
+                    if _os_drift_guard.environ.get("EPF_LSTM_EMBEDDINGS", "false").lower() == "true":
+                        _missing_lstm = [f for f in feature_cols
+                                         if f.startswith("lstm_emb_") and f not in row.columns]
+                        if _missing_lstm:
+                            raise RuntimeError(
+                                f"EPF_LSTM_EMBEDDINGS=true but {len(_missing_lstm)} lstm_emb_* "
+                                f"features are missing from the 15-min feature dict "
+                                f"(group={group_name}, q={q}). Sample: {_missing_lstm[:5]}. "
+                                f"_build_origin_features_15min must call "
+                                f"LSTMEmbedder.compute_embedding() (or its batch equivalent) "
+                                f"so the trained model's lstm_emb_* columns are populated. "
+                                f"Silent zero-fill produced degraded predictions historically; "
+                                f"this guard refuses to repeat that. Either fix the 15-min "
+                                f"feature builder or unset EPF_LSTM_EMBEDDINGS."
+                            )
                     for f in feature_cols:
                         if f not in row.columns:
                             row[f] = 0.0
@@ -379,6 +465,16 @@ class DirectPredictor:
                         pred_price = float(model.predict(row[feature_cols].values)[0])
                     except Exception:
                         pred_price = float(price.tail(96).mean())
+
+                    # S1: Inverse target transform — add baseline back
+                    _tt = getattr(self.trainer, 'target_transform', 'none')
+                    if _tt in ("residual_1w", "residual_4w", "residual_4w_ewm"):
+                        _bl_key = ("target_baseline_1w" if _tt == "residual_1w"
+                                   else "target_baseline_4w_ewm" if _tt == "residual_4w_ewm"
+                                   else "target_baseline_4w")
+                        _bl_val = feat.get(_bl_key)
+                        if _bl_val is not None and not np.isnan(_bl_val):
+                            pred_price = pred_price + _bl_val
                 else:
                     pred_price = float(price.tail(96).mean())
 
@@ -397,6 +493,20 @@ class DirectPredictor:
         result = result.sort_values(
             ["target_date", "target_hour", "target_minute"]
         ).reset_index(drop=True)
+
+        # Apply post-processing: isotonic calibration → residual correction (15-min)
+        if len(result) > 0 and (self.trainer.isotonic_calibrator or self.trainer.residual_corrector):
+            quarters_ahead = result["_quarters_ahead"].values
+            target_hours = result["target_hour"].values.astype(float)
+            target_dows = pd.to_datetime(result["target_date"]).dt.dayofweek.values.astype(float)
+
+            if self.trainer.isotonic_calibrator:
+                result["predicted_price"] = self.trainer.isotonic_calibrator.transform(
+                    result["predicted_price"].values, quarters_ahead)
+
+            if self.trainer.residual_corrector:
+                result["predicted_price"] = self.trainer.residual_corrector.apply(
+                    result["predicted_price"].values, target_hours, target_dows, quarters_ahead)
 
         if self.trainer.conformal_calibrator is not None and len(result) > 0:
             intervals = self.trainer.conformal_calibrator.predict_intervals(
@@ -474,6 +584,41 @@ class DirectPredictor:
                     same_wd_prices.append(price.iloc[idx])
             feat["price_same_weekday_4w_avg"] = float(np.mean(same_wd_prices)) if same_wd_prices else np.nan
             feat["price_same_weekday_4w_std"] = float(np.std(same_wd_prices)) if len(same_wd_prices) >= 2 else np.nan
+
+            # V10: LSTM temporal embeddings at inference (env-gated)
+            import os as _os_lstm_pred
+            if _os_lstm_pred.environ.get("EPF_LSTM_EMBEDDINGS", "false").lower() == "true":
+                if not hasattr(self, '_lstm_embedder'):
+                    from src.models.lstm_embedder import LSTMEmbedder
+                    _lp = _os_lstm_pred.environ.get("EPF_LSTM_MODEL_PATH", "data/models/lstm_encoder.pt")
+                    self._lstm_embedder = LSTMEmbedder(model_path=_lp)
+                _emb = self._lstm_embedder.compute_embedding(price, origin_idx)
+                feat.update(_emb)
+
+            # Target-aligned weekly baseline (price at target_hour minus 7 days)
+            target_1w_idx = origin_idx + hours_ahead - 168
+            feat["target_baseline_1w"] = price.iloc[target_1w_idx] if target_1w_idx >= 0 else np.nan
+
+            # Target-aligned 4-week same-weekday baseline (S1: for residual transform)
+            _t4w_prices = []
+            for _w in range(1, 5):
+                _t4w_idx = origin_idx + hours_ahead - (_w * 168)
+                if _t4w_idx >= 0:
+                    _t4w_prices.append(price.iloc[_t4w_idx])
+            feat["target_baseline_4w"] = float(np.mean(_t4w_prices)) if _t4w_prices else np.nan
+
+            # 4-week EWM baseline (recent weeks weighted more: w1=0.4, w2=0.3, w3=0.2, w4=0.1)
+            _ewm_full_weights = [0.4, 0.3, 0.2, 0.1]
+            _ewm_prices, _ewm_w = [], []
+            for _w in range(1, 5):
+                _t4w_idx = origin_idx + hours_ahead - (_w * 168)
+                if _t4w_idx >= 0:
+                    _ewm_prices.append(price.iloc[_t4w_idx])
+                    _ewm_w.append(_ewm_full_weights[_w - 1])
+            feat["target_baseline_4w_ewm"] = (
+                float(sum(p * w for p, w in zip(_ewm_prices, _ewm_w)) / sum(_ewm_w))
+                if _ewm_prices else np.nan
+            )
 
             # Rolling statistics
             recent_24 = price.iloc[max(0, origin_idx - 24):origin_idx]
@@ -788,10 +933,20 @@ class DirectPredictor:
         now = datetime.datetime.now(datetime.timezone.utc)
         prediction_date = now.strftime("%Y-%m-%d")
 
-        # Find the most recent 15-min step as origin
-        origin_dt = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+        # Snap origin to the reference hour that horizon groups were trained on.
+        # DA groups assume origin=10:00 UTC, strategic groups assume origin=15:00 UTC.
+        # Without snapping, a late cron run (e.g. 11:15 instead of 10:00) shifts
+        # all targets, causing the first slots of D+1 to be lost.
+        ref_hour = 15 if run_mode == "strategic" else 10
+        origin_dt = now.replace(hour=ref_hour, minute=0, second=0, microsecond=0)
+        # If we haven't reached the reference hour yet, use yesterday's
+        if origin_dt > now:
+            origin_dt -= datetime.timedelta(days=1)
+        origin_dt = pd.Timestamp(origin_dt)
         if origin_dt not in recent.index:
-            origin_dt = recent.index[-1]
+            # Fall back to nearest available timestamp before the reference
+            valid = recent.index[recent.index <= origin_dt]
+            origin_dt = valid[-1] if len(valid) > 0 else recent.index[-1]
 
         origin_idx = recent.index.get_loc(origin_dt)
         if isinstance(origin_idx, slice):
@@ -837,6 +992,29 @@ class DirectPredictor:
 
                 if feat is not None:
                     row = pd.DataFrame([feat])
+                    # M0.5 drift guard (added 2026-04-08): refuse to silently
+                    # zero-fill missing lstm_emb_* features when LSTM is enabled.
+                    # Historical bug: _build_origin_features_15min never calls
+                    # LSTMEmbedder.compute_embedding(), so any lstm_emb_* feature
+                    # in the trained model's feature_cols was being filled with
+                    # 0.0 here, producing degraded live predictions with no error.
+                    # See project_v10_1_lstm_skew.md for the full investigation.
+                    import os as _os_drift_guard
+                    if _os_drift_guard.environ.get("EPF_LSTM_EMBEDDINGS", "false").lower() == "true":
+                        _missing_lstm = [f for f in feature_cols
+                                         if f.startswith("lstm_emb_") and f not in row.columns]
+                        if _missing_lstm:
+                            raise RuntimeError(
+                                f"EPF_LSTM_EMBEDDINGS=true but {len(_missing_lstm)} lstm_emb_* "
+                                f"features are missing from the 15-min feature dict "
+                                f"(group={group_name}, q={q}). Sample: {_missing_lstm[:5]}. "
+                                f"This means _build_origin_features_15min is not calling "
+                                f"LSTMEmbedder.compute_embedding(). Silent zero-fill of these "
+                                f"features previously produced degraded predictions with no "
+                                f"surfaced error. Either implement the LSTM call in the 15-min "
+                                f"feature builder or unset EPF_LSTM_EMBEDDINGS until M0.5 ships "
+                                f"the fix. See memory: project_v10_1_lstm_skew.md."
+                            )
                     for f in feature_cols:
                         if f not in row.columns:
                             row[f] = 0.0
@@ -849,6 +1027,16 @@ class DirectPredictor:
                         logger.warning("15min prediction error %s q=%d: %s",
                                        group_name, q, e)
                         pred_price = float(price.tail(96).mean())
+
+                    # S1: Inverse target transform — add baseline back
+                    _tt = getattr(self.trainer, 'target_transform', 'none')
+                    if _tt in ("residual_1w", "residual_4w", "residual_4w_ewm"):
+                        _bl_key = ("target_baseline_1w" if _tt == "residual_1w"
+                                   else "target_baseline_4w_ewm" if _tt == "residual_4w_ewm"
+                                   else "target_baseline_4w")
+                        _bl_val = feat.get(_bl_key)
+                        if _bl_val is not None and not np.isnan(_bl_val):
+                            pred_price = pred_price + _bl_val
                 else:
                     pred_price = float(price.tail(96).mean())
 
@@ -870,6 +1058,20 @@ class DirectPredictor:
         result = result.sort_values(
             ["target_date", "target_hour", "target_minute"]
         ).reset_index(drop=True)
+
+        # Apply post-processing: isotonic calibration → residual correction (15-min live)
+        if len(result) > 0 and (self.trainer.isotonic_calibrator or self.trainer.residual_corrector):
+            quarters_ahead = result["_quarters_ahead"].values
+            target_hours = result["target_hour"].values.astype(float)
+            target_dows = pd.to_datetime(result["target_date"]).dt.dayofweek.values.astype(float)
+
+            if self.trainer.isotonic_calibrator:
+                result["predicted_price"] = self.trainer.isotonic_calibrator.transform(
+                    result["predicted_price"].values, quarters_ahead)
+
+            if self.trainer.residual_corrector:
+                result["predicted_price"] = self.trainer.residual_corrector.apply(
+                    result["predicted_price"].values, target_hours, target_dows, quarters_ahead)
 
         # Add confidence intervals
         if self.trainer.conformal_calibrator is not None and len(result) > 0:
@@ -925,6 +1127,31 @@ class DirectPredictor:
                     same_wd_prices.append(price.iloc[idx])
             feat["price_same_weekday_4w_avg"] = float(np.mean(same_wd_prices)) if same_wd_prices else np.nan
             feat["price_same_weekday_4w_std"] = float(np.std(same_wd_prices)) if len(same_wd_prices) >= 2 else np.nan
+
+            # Target-aligned weekly baseline (price at target_quarter minus 7 days)
+            target_1w_idx = origin_idx + quarters_ahead - 672
+            feat["target_baseline_1w"] = price.iloc[target_1w_idx] if target_1w_idx >= 0 else np.nan
+
+            # Target-aligned 4-week same-weekday baseline (S1: for residual transform)
+            _t4w_prices = []
+            for _w in range(1, 5):
+                _t4w_idx = origin_idx + quarters_ahead - (_w * 672)
+                if _t4w_idx >= 0:
+                    _t4w_prices.append(price.iloc[_t4w_idx])
+            feat["target_baseline_4w"] = float(np.mean(_t4w_prices)) if _t4w_prices else np.nan
+
+            # 4-week EWM baseline (recent weeks weighted more: w1=0.4, w2=0.3, w3=0.2, w4=0.1)
+            _ewm_full_weights = [0.4, 0.3, 0.2, 0.1]
+            _ewm_prices, _ewm_w = [], []
+            for _w in range(1, 5):
+                _t4w_idx = origin_idx + quarters_ahead - (_w * 672)
+                if _t4w_idx >= 0:
+                    _ewm_prices.append(price.iloc[_t4w_idx])
+                    _ewm_w.append(_ewm_full_weights[_w - 1])
+            feat["target_baseline_4w_ewm"] = (
+                float(sum(p * w for p, w in zip(_ewm_prices, _ewm_w)) / sum(_ewm_w))
+                if _ewm_prices else np.nan
+            )
 
             # Rolling stats
             recent_24h = price.iloc[max(0, origin_idx - 96):origin_idx]
@@ -1148,11 +1375,6 @@ class DirectPredictor:
                       weather_hourly_df=None, run_mode: str | None = None,
                       bias_correct: bool = True):
         """Generate predictions and store them in the database.
-
-        # NOTE: This method stores predictions to the database and backfills
-        # actual prices — infrastructure concerns not included in this extract.
-        # The BiasCorrector and pipeline.store_predictions/backfill_actual_prices
-        # are application-level components.
 
         Args:
             bias_correct: If True, apply rolling bias correction and negative

@@ -1,6 +1,18 @@
 # EPForecast Methodology — Direct Multi-Horizon Training
 # Extracted from the EPForecast project (github.com/JorgeLopezLan/epf-methodology)
 # Full application: epf.productjorge.com | Docs: epforecast.vercel.app
+#
+# Updated 2026-04-09 to v11.0 (M0.6 Phase C). v11.0 = single XGBoost +
+# residual_1w + pw3x + d365 (no LSTM, no ensemble). The v10.x LSTM-XGBoost
+# hybrid line of experiments was retracted on 2026-04-09 after two layered
+# code-level bugs were found that meant the LSTM block contributed zero
+# useful signal at both training and inference time. The LSTM gating code
+# at line ~1290 still exists, gated by EPF_LSTM_EMBEDDINGS=true (default
+# false post-M0.6) — re-enabling it without first fixing the underlying
+# bugs is caught by the drift guard at the matching predictor call sites.
+# See SANITIZATION_RULES.md and the v11.0 changelog page on the project
+# website for the full retraction story.
+
 """
 Direct multi-horizon model training for EPF.
 
@@ -14,11 +26,54 @@ import datetime
 import joblib
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo
+
+# M0.6 Phase C — DST experiment helpers (2026-04-09)
+# These were added to test whether replacing UTC-hour cyclical encoding with
+# Madrid-local-hour encoding would improve model performance. The hypothesis
+# was that the model learns "UTC hour 18 → evening peak" instead of "local
+# hour 19-21 → evening peak" and that the misalignment hurts predictions
+# across DST transitions.
+#
+# Result: A/B test on the v11.0 backtest window (2025-10-09 → 2026-03-18)
+# showed the local-hour encoding marginally improves dayahead MAE (-0.05)
+# but REGRESSES strategic MAE by +0.36 and strategic SpkR by -0.59pp. Net
+# verdict: not worth shipping in M0.6.
+#
+# Why the fix didn't help: the price lag features (price_lag_24h,
+# price_lag_168h, etc.) already encode hour-of-day patterns implicitly. The
+# explicit cyclical encoding is partially redundant. Switching its semantics
+# changes the noise pattern without adding signal.
+#
+# These helpers are KEPT (not removed) for two reasons:
+#   1. M1+ multi-country work for PT/FR/DE will need per-country local-time
+#      feature engineering eventually
+#   2. A fuller DST refactor that ALSO touches the morning/evening hour-band
+#      aggregates (lines ~373-396, ~817-838) and the operational hour filters
+#      may yet help — that's a future tier-7 experiment
+#
+# See project_dst_feature_drift.md, m06_phase_c_results.md.
+_LOCAL_TZ = ZoneInfo("Europe/Madrid")  # multi-country: parameterize per country in M4
+
+def _local_hour(dt):
+    """Convert a UTC-aware pandas/datetime Timestamp to local-time hour (0-23).
+    Currently UNUSED (see DST experiment note above). Kept for M1+."""
+    if dt.tzinfo is None:
+        return dt.hour  # naive timestamp — assume already local
+    return dt.tz_convert(_LOCAL_TZ).hour if hasattr(dt, "tz_convert") else dt.astimezone(_LOCAL_TZ).hour
+
+def _local_dow(dt):
+    """Convert a UTC-aware pandas/datetime Timestamp to local-time dayofweek (0-6).
+    Currently UNUSED (see DST experiment note above). Kept for M1+."""
+    if dt.tzinfo is None:
+        return dt.dayofweek if hasattr(dt, "dayofweek") else dt.weekday()
+    local = dt.tz_convert(_LOCAL_TZ) if hasattr(dt, "tz_convert") else dt.astimezone(_LOCAL_TZ)
+    return local.dayofweek if hasattr(local, "dayofweek") else local.weekday()
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-MODELS_DIR = None  # Set to your model artifacts directory (pathlib.Path)
+from src.config import MODELS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +462,13 @@ def build_direct_features(ree_df: pd.DataFrame, horizon_hours: list[int],
             feat["price_evening_slope"] = np.nan
 
         # Origin time features
+        # NOTE: M0.6 Phase C tested replacing these with Madrid-local-time
+        # encoding via _local_hour()/_local_dow() helpers above. Result: the
+        # local-hour fix slightly improved dayahead MAE (-0.05) but regressed
+        # strategic MAE by +0.36 and strategic SpkR by -0.59pp. Reverted to
+        # UTC for v11.0. The helpers are kept in module scope for future M1+
+        # multi-country work, where a fuller DST refactor (also touching the
+        # hour-band aggregates and operational filters) may be revisited.
         feat["origin_hour_sin"] = np.sin(2 * np.pi * origin_dt.hour / 24)
         feat["origin_hour_cos"] = np.cos(2 * np.pi * origin_dt.hour / 24)
         feat["origin_dow_sin"] = np.sin(2 * np.pi * origin_dt.dayofweek / 7)
@@ -445,6 +507,24 @@ def build_direct_features(ree_df: pd.DataFrame, horizon_hours: list[int],
 
         # Weekend/holiday at origin
         feat["origin_is_weekend"] = 1.0 if origin_dt.dayofweek >= 5 else 0.0
+
+        # V7: Monday features (Monday MAE = 20.18 vs 12 for other days)
+        feat["is_monday"] = 1.0 if origin_dt.dayofweek == 0 else 0.0
+        # Weekend average price (Sat + Sun preceding this origin)
+        if origin_dt.dayofweek == 0 and origin_idx >= 48:  # Monday with enough history
+            _sat_sun = price.iloc[max(0, origin_idx - 48):origin_idx]
+            feat["weekend_price_avg"] = _sat_sun.mean() if len(_sat_sun) > 0 else np.nan
+        elif origin_dt.dayofweek <= 4 and origin_idx >= 120:  # Weekday: look back to last weekend
+            _days_since_sun = origin_dt.dayofweek + 1
+            _sun_idx = origin_idx - _days_since_sun * 24
+            _sat_idx = _sun_idx - 24
+            if _sat_idx >= 0:
+                _wkend = price.iloc[_sat_idx:_sun_idx + 24]
+                feat["weekend_price_avg"] = _wkend.mean() if len(_wkend) > 0 else np.nan
+            else:
+                feat["weekend_price_avg"] = 0.0
+        else:
+            feat["weekend_price_avg"] = 0.0
 
         # Weather features at origin
         if weather_hourly_df is not None and not weather_hourly_df.empty:
@@ -533,6 +613,8 @@ def build_direct_features(ree_df: pd.DataFrame, horizon_hours: list[int],
             sample = feat.copy()
 
             # Target time features (cyclical encoding of the future hour)
+            # NOTE: M0.6 Phase C reverted from local-hour back to UTC. See
+            # the matching note above the origin_hour_sin block for details.
             sample["target_hour_sin"] = np.sin(2 * np.pi * target_dt.hour / 24)
             sample["target_hour_cos"] = np.cos(2 * np.pi * target_dt.hour / 24)
             sample["target_dow_sin"] = np.sin(2 * np.pi * target_dt.dayofweek / 7)
@@ -613,6 +695,31 @@ def build_direct_features(ree_df: pd.DataFrame, horizon_hours: list[int],
                 sample["d1_std_price"] = np.nan
                 sample["d1_peak_spread"] = np.nan
                 sample["d1_same_hour_price"] = np.nan
+
+            # Target-aligned weekly baseline (price at target_hour minus 7 days)
+            target_1w_idx = target_idx - 168  # 168h = 7 days
+            sample["target_baseline_1w"] = price.iloc[target_1w_idx] if target_1w_idx >= 0 else np.nan
+
+            # Target-aligned 4-week same-weekday baseline (S1: for residual transform)
+            _t4w_prices = []
+            for _w in range(1, 5):
+                _t4w_idx = target_idx - (_w * 168)
+                if _t4w_idx >= 0:
+                    _t4w_prices.append(price.iloc[_t4w_idx])
+            sample["target_baseline_4w"] = float(np.mean(_t4w_prices)) if _t4w_prices else np.nan
+
+            # 4-week EWM baseline (recent weeks weighted more: w1=0.4, w2=0.3, w3=0.2, w4=0.1)
+            _ewm_full_weights = [0.4, 0.3, 0.2, 0.1]
+            _ewm_prices, _ewm_w = [], []
+            for _w in range(1, 5):
+                _t4w_idx = target_idx - (_w * 168)
+                if _t4w_idx >= 0:
+                    _ewm_prices.append(price.iloc[_t4w_idx])
+                    _ewm_w.append(_ewm_full_weights[_w - 1])
+            sample["target_baseline_4w_ewm"] = (
+                float(sum(p * w for p, w in zip(_ewm_prices, _ewm_w)) / sum(_ewm_w))
+                if _ewm_prices else np.nan
+            )
 
             # Target price
             sample["target_price"] = price.iloc[target_idx]
@@ -806,6 +913,8 @@ def build_direct_features_15min(ree_15min_df: pd.DataFrame,
             feat["price_evening_slope"] = np.nan
 
         # Origin time features
+        # NOTE: M0.6 Phase C reverted from local-hour back to UTC. See the
+        # detailed note in the hourly _build_origin_features() block above.
         feat["origin_hour_sin"] = np.sin(2 * np.pi * origin_dt.hour / 24)
         feat["origin_hour_cos"] = np.cos(2 * np.pi * origin_dt.hour / 24)
         feat["origin_dow_sin"] = np.sin(2 * np.pi * origin_dt.dayofweek / 7)
@@ -813,6 +922,18 @@ def build_direct_features_15min(ree_15min_df: pd.DataFrame,
         feat["origin_month_sin"] = np.sin(2 * np.pi * origin_dt.month / 12)
         feat["origin_month_cos"] = np.cos(2 * np.pi * origin_dt.month / 12)
         feat["origin_is_weekend"] = 1.0 if origin_dt.dayofweek >= 5 else 0.0
+
+        # V7: Monday features (15-min path)
+        feat["is_monday"] = 1.0 if origin_dt.dayofweek == 0 else 0.0
+        if origin_dt.dayofweek == 0 and i >= 192:
+            feat["weekend_price_avg"] = price.iloc[max(0, i - 192):i].mean()
+        elif origin_dt.dayofweek <= 4 and i >= 480:
+            _days_since_sun = origin_dt.dayofweek + 1
+            _sun_idx = i - _days_since_sun * 96
+            _sat_idx = _sun_idx - 96
+            feat["weekend_price_avg"] = price.iloc[_sat_idx:_sun_idx + 96].mean() if _sat_idx >= 0 else np.nan
+        else:
+            feat["weekend_price_avg"] = 0.0
 
         # Demand features (15-min resolution)
         if "real_demand" in df.columns:
@@ -851,7 +972,7 @@ def build_direct_features_15min(ree_15min_df: pd.DataFrame,
         feat["nuclear_share"] = nuclear_val / demand_safe if demand_safe else np.nan
         feat["residual_demand"] = demand_val - total_ren - nuclear_val
 
-        # Weather features at origin (broadcast hourly -> 15-min)
+        # Weather features at origin (broadcast hourly → 15-min)
         if weather_15min is not None and origin_dt in weather_15min.index:
             w_row = weather_15min.loc[origin_dt]
             for col in weather_15min.columns:
@@ -915,6 +1036,8 @@ def build_direct_features_15min(ree_15min_df: pd.DataFrame,
             sample = feat.copy()
 
             # Target time features — quarter-hour encoding (96-period cycle)
+            # NOTE: M0.6 Phase C reverted from local-hour back to UTC. See
+            # the detailed note in the hourly _build_origin_features() block.
             quarter_of_day = target_dt.hour * 4 + target_dt.minute // 15
             sample["target_quarter_sin"] = np.sin(2 * np.pi * quarter_of_day / 96)
             sample["target_quarter_cos"] = np.cos(2 * np.pi * quarter_of_day / 96)
@@ -985,6 +1108,31 @@ def build_direct_features_15min(ree_15min_df: pd.DataFrame,
                 sample["d1_peak_spread"] = np.nan
                 sample["d1_same_hour_price"] = np.nan
 
+            # Target-aligned weekly baseline (price at target quarter minus 7 days)
+            target_1w_idx = target_idx - 672  # 672 quarters = 7 days at 15-min
+            sample["target_baseline_1w"] = price.iloc[target_1w_idx] if target_1w_idx >= 0 else np.nan
+
+            # Target-aligned 4-week same-weekday baseline (S1: for residual transform)
+            _t4w_prices = []
+            for _w in range(1, 5):
+                _t4w_idx = target_idx - (_w * 672)
+                if _t4w_idx >= 0:
+                    _t4w_prices.append(price.iloc[_t4w_idx])
+            sample["target_baseline_4w"] = float(np.mean(_t4w_prices)) if _t4w_prices else np.nan
+
+            # 4-week EWM baseline (recent weeks weighted more: w1=0.4, w2=0.3, w3=0.2, w4=0.1)
+            _ewm_full_weights = [0.4, 0.3, 0.2, 0.1]
+            _ewm_prices, _ewm_w = [], []
+            for _w in range(1, 5):
+                _t4w_idx = target_idx - (_w * 672)
+                if _t4w_idx >= 0:
+                    _ewm_prices.append(price.iloc[_t4w_idx])
+                    _ewm_w.append(_ewm_full_weights[_w - 1])
+            sample["target_baseline_4w_ewm"] = (
+                float(sum(p * w for p, w in zip(_ewm_prices, _ewm_w)) / sum(_ewm_w))
+                if _ewm_prices else np.nan
+            )
+
             sample["target_price"] = price.iloc[target_idx]
             sample["_origin_dt"] = origin_dt
             sample["_target_dt"] = target_dt
@@ -1023,13 +1171,21 @@ class DirectMultiHorizonTrainer:
         self.feature_names: dict[str, list[str]] = {}
         self.metrics: dict[str, list[dict]] = {}
         self.conformal_calibrator = None
+        self.isotonic_calibrator = None
+        self.residual_corrector = None
+        self.target_transform = "none"
+        self.peak_split = None
 
     def train_all(self, ree_df: pd.DataFrame, n_splits: int = 5,
                   weather_df: pd.DataFrame | None = None,
                   commodity_df: pd.DataFrame | None = None,
                   weather_hourly_df: pd.DataFrame | None = None,
                   resolution: str = "hourly",
-                  run_mode: str | None = None) -> dict:
+                  run_mode: str | None = None,
+                  return_oof: bool = False,
+                  peak_split: str | None = None,
+                  cache_features: bool = False,
+                  cache_dir: str = "data/cached") -> dict | tuple:
         """
         Train one model per horizon group.
 
@@ -1043,8 +1199,13 @@ class DirectMultiHorizonTrainer:
         resolution : "hourly" or "15min". Determines horizon groups and features.
         run_mode : "dayahead", "strategic", or None (legacy).
                    Selects horizon groups and filters training origins.
+        return_oof : If True, also return OOF predictions for post-processing
+                     (isotonic calibration, residual correction, stacking).
 
         Returns dict of {group_name: fold_metrics}.
+        If return_oof=True, returns (all_metrics, oof_data) where oof_data is
+        a dict of {group_name: {"predictions": arr, "actuals": arr,
+        "horizons": arr, "hours": arr, "dows": arr}}.
         """
         if resolution == "15min" and run_mode == "dayahead":
             horizon_groups = HORIZON_GROUPS_15MIN_DAYAHEAD
@@ -1059,30 +1220,100 @@ class DirectMultiHorizonTrainer:
         else:
             horizon_groups = HORIZON_GROUPS
 
+        import time
+        from pathlib import Path
+
         all_metrics = {}
         all_oof_residuals = []
         all_oof_horizons = []
+        oof_data = {} if return_oof else None
+
+        # Feature cache: staleness reference is the most recently modified source file
+        _db_path = Path("data/epf.db")
+        _feat_eng_path = Path("src/data/feature_engineering.py")
+        _config_path = Path("src/config.py")
+        _source_mtime = max(
+            _db_path.stat().st_mtime if _db_path.exists() else 0,
+            _feat_eng_path.stat().st_mtime if _feat_eng_path.exists() else 0,
+            _config_path.stat().st_mtime if _config_path.exists() else 0,
+        )
+        _cache_dir = Path(cache_dir)
+
+        # S1: Store target transform type on self for artifact serialization
+        import os as _os_tt_init
+        self.target_transform = _os_tt_init.environ.get(
+            "EPF_TARGET_TRANSFORM", "none"
+        ).strip().lower()
 
         for group_name, horizons in horizon_groups.items():
-            if resolution == "15min":
-                logger.info("Training %s (quarters %d-%d, run_mode=%s)...",
-                            group_name, min(horizons), max(horizons),
-                            run_mode or "legacy")
-                data = build_direct_features_15min(
-                    ree_df, horizons,
-                    weather_hourly_df=weather_hourly_df,
-                    commodity_df=commodity_df,
-                    run_mode=run_mode,
+            t_group_start = time.time()
+
+            # --- Feature building (with optional cache) ---
+            _cache_file = _cache_dir / f"features_{resolution}_{run_mode or 'legacy'}_{group_name}.parquet"
+            _cache_exists = _cache_file.exists()
+            _cache_fresh = _cache_exists and _cache_file.stat().st_mtime > _source_mtime
+            _cache_hit = cache_features and _cache_fresh
+
+            if _cache_hit:
+                logger.info(
+                    "Loading cached features for %s (cache newer than db/feature_engineering/config)",
+                    group_name,
                 )
+                t_feat_start = time.time()
+                data = pd.read_parquet(_cache_file)
+                t_feat = time.time() - t_feat_start
+                logger.info("  %s feature load: %.1fs (cache hit)", group_name, t_feat)
             else:
-                logger.info("Training %s (hours %d-%d, run_mode=%s)...",
-                            group_name, min(horizons), max(horizons),
-                            run_mode or "legacy")
-                data = build_direct_features(
-                    ree_df, horizons, weather_df, commodity_df,
-                    weather_hourly_df=weather_hourly_df,
-                    run_mode=run_mode,
-                )
+                if cache_features and _cache_exists and not _cache_fresh:
+                    # Explain why cache was invalidated
+                    for src, path in [("data/epf.db", _db_path),
+                                      ("feature_engineering.py", _feat_eng_path),
+                                      ("config.py", _config_path)]:
+                        if path.exists() and path.stat().st_mtime > _cache_file.stat().st_mtime:
+                            logger.info(
+                                "  %s cache invalidated: %s is newer than cache", group_name, src
+                            )
+                            break
+
+                t_feat_start = time.time()
+                if resolution == "15min":
+                    logger.info("Training %s (quarters %d-%d, run_mode=%s)...",
+                                group_name, min(horizons), max(horizons),
+                                run_mode or "legacy")
+                    data = build_direct_features_15min(
+                        ree_df, horizons,
+                        weather_hourly_df=weather_hourly_df,
+                        commodity_df=commodity_df,
+                        run_mode=run_mode,
+                    )
+                else:
+                    logger.info("Training %s (hours %d-%d, run_mode=%s)...",
+                                group_name, min(horizons), max(horizons),
+                                run_mode or "legacy")
+                    data = build_direct_features(
+                        ree_df, horizons, weather_df, commodity_df,
+                        weather_hourly_df=weather_hourly_df,
+                        run_mode=run_mode,
+                    )
+                t_feat = time.time() - t_feat_start
+                logger.info("  %s feature build: %.1fs", group_name, t_feat)
+
+                if cache_features and not data.empty:
+                    _cache_dir.mkdir(parents=True, exist_ok=True)
+                    data.to_parquet(_cache_file)
+                    logger.info("  %s features cached to %s", group_name, _cache_file)
+            # Filter by target hour for peak/off-peak split
+            if peak_split:
+                from src.config import PEAK_HOURS
+                target_hours = data["_target_dt"].dt.hour
+                if peak_split == "peak":
+                    data = data[target_hours.isin(PEAK_HOURS)]
+                elif peak_split == "offpeak":
+                    data = data[~target_hours.isin(PEAK_HOURS)]
+                logger.info("  %s peak_split=%s: %d samples after filter",
+                            group_name, peak_split, len(data))
+            self.peak_split = peak_split
+
             if data.empty or len(data) < 200:
                 logger.warning("Skipping %s: insufficient data (%d samples)", group_name, len(data))
                 continue
@@ -1100,12 +1331,117 @@ class DirectMultiHorizonTrainer:
                     group_name, target_stats["max"],
                 )
 
-            # Separate features from metadata/target
+            # V10: LSTM temporal embeddings (env-gated, post-cache)
+            import os as _os_lstm
+            if _os_lstm.environ.get("EPF_LSTM_EMBEDDINGS", "false").lower() == "true":
+                from src.models.lstm_embedder import LSTMEmbedder
+                _lstm_path = _os_lstm.environ.get("EPF_LSTM_MODEL_PATH", "data/models/lstm_encoder.pt")
+                if not hasattr(self, '_lstm_embedder'):
+                    self._lstm_embedder = LSTMEmbedder(model_path=_lstm_path)
+                _emb_cols = self._lstm_embedder.compute_embeddings_batch(
+                    ree_df["day_ahead_price"], data["_origin_dt"], ree_df=ree_df)
+                for col, vals in _emb_cols.items():
+                    data[col] = vals
+                logger.info("%s: added %d LSTM embedding features", group_name, len(_emb_cols))
+
+            # Separate features from metadata/target.
+            # M0.6 Phase C pre-flight (2026-04-09): also exclude object-dtype
+            # columns. The multi-country PG schema added `weather_country`
+            # and `commodity_country` columns (currently always 'ES') that
+            # got merged into the feature DataFrame and broke .astype(float).
+            # Filter by dtype rather than name so any future string column
+            # added to the upstream tables doesn't reintroduce the bug.
             meta_cols = ["target_price", "_origin_dt", "_target_dt"]
-            feature_cols = [c for c in data.columns if c not in meta_cols]
+            feature_cols = [
+                c for c in data.columns
+                if c not in meta_cols and data[c].dtype != "object"
+            ]
 
             X = data[feature_cols].astype(float)
             y = data["target_price"]
+
+            # Sprint C: Winsorize extreme prices (crisis data treatment)
+            from src.config import WINSORIZE_CAP, SAMPLE_WEIGHT_HALFLIFE
+            if WINSORIZE_CAP is not None:
+                n_capped = (y > WINSORIZE_CAP).sum()
+                if n_capped > 0:
+                    logger.info(
+                        "%s: winsorizing %d samples (%.1f%%) above %.0f EUR",
+                        group_name, n_capped, 100 * n_capped / len(y), WINSORIZE_CAP,
+                    )
+                    y = y.clip(upper=WINSORIZE_CAP)
+
+            # S1: Target transform — predict residuals from baseline
+            from src.config import TARGET_TRANSFORM
+            import os as _os_tt
+            _transform = _os_tt.environ.get("EPF_TARGET_TRANSFORM", TARGET_TRANSFORM or "none").strip().lower()
+            _baseline_col = None
+            if _transform == "residual_1w":
+                _baseline_col = "target_baseline_1w"
+            elif _transform == "residual_4w":
+                _baseline_col = "target_baseline_4w"
+            elif _transform == "residual_4w_ewm":
+                _baseline_col = "target_baseline_4w_ewm"
+
+            # Keep original prices for price-weighting thresholds (before transform)
+            _original_prices = y.copy()
+
+            if _baseline_col and _baseline_col in data.columns:
+                _baseline = data[_baseline_col]
+                _valid_bl = _baseline.notna()
+                _n_dropped = (~_valid_bl).sum()
+                if _n_dropped > 0:
+                    logger.info(
+                        "%s: target transform=%s, dropping %d samples (%.1f%%) with NaN baseline",
+                        group_name, _transform, _n_dropped, 100 * _n_dropped / len(data),
+                    )
+                    data = data[_valid_bl].copy()
+                    X = data[feature_cols].astype(float)
+                    _original_prices = data["target_price"]
+                    if WINSORIZE_CAP is not None:
+                        _original_prices = _original_prices.clip(upper=WINSORIZE_CAP)
+                    _baseline = data[_baseline_col]
+
+                y = _original_prices - _baseline
+                logger.info(
+                    "%s: target transform=%s, residual stats: mean=%.2f, std=%.2f, range=[%.2f, %.2f]",
+                    group_name, _transform, y.mean(), y.std(), y.min(), y.max(),
+                )
+            elif _transform not in ("none", ""):
+                logger.warning(
+                    "%s: target transform '%s' requested but baseline col '%s' not found, using raw prices",
+                    group_name, _transform, _baseline_col,
+                )
+
+            # Sprint C: Time-decay sample weights
+            sample_weights = None
+            if SAMPLE_WEIGHT_HALFLIFE is not None and "_origin_dt" in data.columns:
+                origin_dts = pd.to_datetime(data["_origin_dt"])
+                latest = origin_dts.max()
+                days_ago = (latest - origin_dts).dt.total_seconds() / 86400.0
+                decay = np.log(2) / SAMPLE_WEIGHT_HALFLIFE
+                sample_weights = np.exp(-decay * days_ago)
+                logger.info(
+                    "%s: sample weights range [%.4f, %.4f] (halflife=%dd)",
+                    group_name, sample_weights.min(), sample_weights.max(),
+                    SAMPLE_WEIGHT_HALFLIFE,
+                )
+
+            # V7: Price-weighted sampling — boost weight for high-price samples
+            from src.config import PRICE_WEIGHT_THRESHOLD, PRICE_WEIGHT_MULTIPLIER
+            import os as _os
+            _thresh = float(_os.environ.get("EPF_PRICE_WEIGHT_THRESHOLD", "0")) or (PRICE_WEIGHT_THRESHOLD or 0)
+            _mult = float(_os.environ.get("EPF_PRICE_WEIGHT_MULTIPLIER", "0")) or (PRICE_WEIGHT_MULTIPLIER or 0)
+            if _thresh > 0 and _mult > 0:
+                _high_mask = _original_prices > _thresh
+                if sample_weights is None:
+                    sample_weights = pd.Series(np.ones(len(y)), index=y.index)
+                sample_weights = sample_weights.copy()
+                sample_weights[_high_mask] *= _mult
+                logger.info(
+                    "%s: price-weight applied: %d samples (%.1f%%) above %.0f EUR weighted %.1fx",
+                    group_name, _high_mask.sum(), 100 * _high_mask.sum() / len(y), _thresh, _mult,
+                )
 
             # NaN diagnostics: log per-feature NaN ratio
             nan_ratios = X.isna().mean()
@@ -1118,7 +1454,7 @@ class DirectMultiHorizonTrainer:
                 )
             total_nan_pct = X.isna().any(axis=1).mean()
             logger.info(
-                "%s feature matrix: %d samples x %d features, "
+                "%s feature matrix: %d samples × %d features, "
                 "%.1f%% rows have any NaN",
                 group_name, len(X), len(feature_cols), total_nan_pct * 100,
             )
@@ -1162,7 +1498,18 @@ class DirectMultiHorizonTrainer:
                     logger.warning("  %s Fold %d: skipped (empty after NaN removal)", group_name, fold)
                     continue
 
-                model.fit(X_train, y_train)
+                fit_kwargs = {}
+                if sample_weights is not None:
+                    w_train = sample_weights.iloc[train_idx][train_valid].values
+                    # Pipeline needs step__param syntax for sample_weight
+                    from sklearn.pipeline import Pipeline as _Pipeline
+                    if isinstance(model, _Pipeline):
+                        # Find the estimator step name (last step)
+                        _est_name = model.steps[-1][0]
+                        fit_kwargs[f"{_est_name}__sample_weight"] = w_train
+                    else:
+                        fit_kwargs["sample_weight"] = w_train
+                model.fit(X_train, y_train, **fit_kwargs)
                 y_pred = model.predict(X_val)
 
                 # Filter NaN predictions
@@ -1193,16 +1540,55 @@ class DirectMultiHorizonTrainer:
                     h_vals = np.full(len(residuals), min(horizons))
                 all_oof_horizons.append(h_vals)
 
+                # Collect full OOF data for post-processing (stacking, isotonic, residual)
+                if return_oof:
+                    valid_X = X_val.iloc[pred_valid] if hasattr(pred_valid, '__len__') else X_val.loc[pred_valid]
+                    # Extract hour/dow from cyclical features or target_dt metadata
+                    if "_target_dt" in data.columns:
+                        target_dts = data.loc[valid_X.index, "_target_dt"]
+                        hours = target_dts.apply(lambda dt: dt.hour).values.astype(float)
+                        dows = target_dts.apply(lambda dt: dt.dayofweek).values.astype(float)
+                    else:
+                        hours = np.zeros(len(y_pred_clean))
+                        dows = np.zeros(len(y_pred_clean))
+
+                    if group_name not in oof_data:
+                        oof_data[group_name] = {
+                            "predictions": [], "actuals": [], "horizons": [],
+                            "hours": [], "dows": [],
+                        }
+                    oof_data[group_name]["predictions"].append(y_pred_clean)
+                    oof_data[group_name]["actuals"].append(y_val_clean)
+                    oof_data[group_name]["horizons"].append(h_vals)
+                    oof_data[group_name]["hours"].append(hours)
+                    oof_data[group_name]["dows"].append(dows)
+
             # Final model on all data (drop NaN targets)
+            t_train_start = time.time()
             all_valid = y.notna()
-            model.fit(X.loc[all_valid], y.loc[all_valid])
+            final_fit_kwargs = {}
+            if sample_weights is not None:
+                from sklearn.pipeline import Pipeline as _Pipeline
+                if isinstance(model, _Pipeline):
+                    _est_name = model.steps[-1][0]
+                    final_fit_kwargs[f"{_est_name}__sample_weight"] = sample_weights[all_valid].values
+                else:
+                    final_fit_kwargs["sample_weight"] = sample_weights[all_valid].values
+            model.fit(X.loc[all_valid], y.loc[all_valid], **final_fit_kwargs)
+            t_train = time.time() - t_train_start
             self.models[group_name] = model
             self.feature_names[group_name] = feature_cols
             self.metrics[group_name] = fold_metrics
             all_metrics[group_name] = fold_metrics
 
             avg_mae = np.mean([m["mae"] for m in fold_metrics])
-            logger.info("  %s Average CV MAE: %.2f", group_name, avg_mae)
+            t_group = time.time() - t_group_start
+            cache_label = "cache hit" if _cache_hit else f"built in {t_feat:.0f}s"
+            logger.info(
+                "  %s done: CV MAE=%.2f | features=%s | CV=%.0fs | final fit=%.0fs | total=%.0fs",
+                group_name, avg_mae, cache_label,
+                t_group - t_train - t_feat, t_train, t_group,
+            )
 
         # Fit conformal calibrator from all OOF residuals
         if all_oof_residuals:
@@ -1215,30 +1601,50 @@ class DirectMultiHorizonTrainer:
             logger.info("Conformal calibrator fitted with %d residuals across %d buckets",
                         len(combined_residuals), len(calibrator.residuals_by_bucket))
 
+        # Concatenate OOF data per group
+        if return_oof and oof_data:
+            for group_name in oof_data:
+                for key in oof_data[group_name]:
+                    if oof_data[group_name][key]:
+                        oof_data[group_name][key] = np.concatenate(oof_data[group_name][key])
+                    else:
+                        oof_data[group_name][key] = np.array([])
+            total_oof = sum(len(v["predictions"]) for v in oof_data.values())
+            logger.info("OOF data collected: %d samples across %d groups",
+                        total_oof, len(oof_data))
+            return all_metrics, oof_data
+
         return all_metrics
 
     @staticmethod
     def _model_suffix(resolution: str = "hourly", approach: str = "hourly",
-                      run_mode: str | None = None) -> str:
-        """Build file suffix from resolution, approach, and run_mode."""
+                      run_mode: str | None = None,
+                      peak_split: str | None = None) -> str:
+        """Build file suffix from resolution, approach, run_mode, and peak_split."""
         if run_mode in ("dayahead", "strategic"):
             if approach == "pure15":
-                return f"_15min_pure_{run_mode}"
+                suffix = f"_15min_pure_{run_mode}"
             elif approach == "hybrid15":
-                return f"_15min_hybrid_{run_mode}"
-            return f"_{run_mode}"
-        if approach == "pure15":
-            return "_15min_pure"
+                suffix = f"_15min_hybrid_{run_mode}"
+            else:
+                suffix = f"_{run_mode}"
+        elif approach == "pure15":
+            suffix = "_15min_pure"
         elif approach == "hybrid15":
-            return "_15min_hybrid"
+            suffix = "_15min_hybrid"
         elif resolution == "15min":
-            return "_15min"
-        return ""
+            suffix = "_15min"
+        else:
+            suffix = ""
+        if peak_split:
+            suffix += f"_{peak_split}"
+        return suffix
 
     def save_models(self, version: str | None = None,
                     resolution: str = "hourly",
                     approach: str = "hourly",
-                    run_mode: str | None = None) -> str:
+                    run_mode: str | None = None,
+                    peak_split: str | None = None) -> str:
         """Save all horizon models as a single artifact."""
         if not self.models:
             raise ValueError("No trained models to save")
@@ -1246,7 +1652,8 @@ class DirectMultiHorizonTrainer:
         if version is None:
             version = datetime.date.today().isoformat()
 
-        suffix = self._model_suffix(resolution, approach, run_mode)
+        ps = peak_split or self.peak_split
+        suffix = self._model_suffix(resolution, approach, run_mode, peak_split=ps)
         path = MODELS_DIR / f"direct_model_{self.model_type}{suffix}_{version}.joblib"
 
         if resolution == "15min":
@@ -1266,6 +1673,7 @@ class DirectMultiHorizonTrainer:
             "resolution": resolution,
             "approach": approach,
             "run_mode": run_mode or "legacy",
+            "peak_split": ps,
             "trained_at": datetime.datetime.utcnow().isoformat(),
             "models": self.models,
             "feature_names": self.feature_names,
@@ -1279,19 +1687,29 @@ class DirectMultiHorizonTrainer:
                 self.feature_selector.to_dict()
                 if self.feature_selector else None
             ),
+            "isotonic_calibrator": (
+                self.isotonic_calibrator.to_dict()
+                if self.isotonic_calibrator else None
+            ),
+            "target_transform": self.target_transform,
+            "residual_corrector": (
+                self.residual_corrector.to_dict()
+                if self.residual_corrector else None
+            ),
         }
         joblib.dump(artifact, path)
-        logger.info("Direct models (%s, run_mode=%s) saved to %s",
-                     self.model_type, run_mode or "legacy", path)
+        logger.info("Direct models (%s, run_mode=%s, peak_split=%s) saved to %s",
+                     self.model_type, run_mode or "legacy", ps, path)
         return str(path)
 
     def load_models(self, version: str = "latest",
                     resolution: str = "hourly",
                     approach: str = "hourly",
-                    run_mode: str | None = None) -> dict:
+                    run_mode: str | None = None,
+                    peak_split: str | None = None) -> dict:
         """Load direct multi-horizon models from disk."""
         mt = self.model_type
-        suffix = self._model_suffix(resolution, approach, run_mode)
+        suffix = self._model_suffix(resolution, approach, run_mode, peak_split=peak_split)
         if version == "latest":
             # Try model-type-specific + resolution + approach + run_mode artifact
             model_files = sorted(MODELS_DIR.glob(f"direct_model_{mt}{suffix}_*.joblib"))
@@ -1338,9 +1756,28 @@ class DirectMultiHorizonTrainer:
         else:
             self.feature_selector = None
 
+        iso_data = artifact.get("isotonic_calibrator")
+        if iso_data:
+            from src.models.post_processing import IsotonicCalibrator
+            self.isotonic_calibrator = IsotonicCalibrator.from_dict(iso_data)
+            logger.info("Isotonic calibrator loaded (%d buckets)", len(self.isotonic_calibrator.models))
+        else:
+            self.isotonic_calibrator = None
+
+        res_data = artifact.get("residual_corrector")
+        if res_data and res_data.get("fitted"):
+            from src.models.post_processing import ResidualCorrector
+            self.residual_corrector = ResidualCorrector.from_dict(res_data)
+            logger.info("Residual corrector loaded")
+        else:
+            self.residual_corrector = None
+
+        self.peak_split = artifact.get("peak_split")
+        self.target_transform = artifact.get("target_transform", "none")
+
         loaded_type = artifact.get("model_type", "histgb")
         loaded_mode = artifact.get("run_mode", "legacy")
-        logger.info("Loaded direct models %s (%s, run_mode=%s, trained %s)",
+        logger.info("Loaded direct models %s (%s, run_mode=%s, peak_split=%s, trained %s)",
                      artifact["version"], loaded_type, loaded_mode,
-                     artifact["trained_at"])
+                     self.peak_split, artifact["trained_at"])
         return artifact
